@@ -35,7 +35,9 @@ CURRENCIES = [
     "HUF", "PEN", "KES", "CRC", "MAD", "CLP", "NOK", "VND",
     "RON", "KZT", "CHF", "KRW", "TWD", "JPY", "SEK", "MMK",
     "IQD", "CZK", "TZS", "BDT", "EGP", "PYG", "RSD", "HKD",
-    "GEL", "DZD", "QAR", "BGN"
+    "GEL", "DZD", "QAR", "BGN", "DKK", "MNT", "HNL", "XAF",
+    "XOF", "JOD", "OMR", "BHD", "KWD", "GTQ", "BOB", "UYU",
+    "ISK", "RWF", "UGX", "GHS", "ETB", "NPR", "LBP", "MZN"
 ]
 
 FRANKFURTER_URL = "https://api.frankfurter.app"
