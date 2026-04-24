@@ -1,0 +1,39 @@
+name: FX Rates → BigQuery Sync
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 3:00 AM UTC daily (runs before staging queries)
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days of FX history to fetch"
+        required: false
+        default: "7"
+
+jobs:
+  sync:
+    name: Fetch Daily FX Rates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r fx_rates/requirements.txt
+
+      - name: Fetch FX rates and load to BigQuery
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET: "cross_platform"
+          BQ_TABLE: "daily_fx_rates"
+          FX_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
+        run: python fx_rates/fx_rates_fetch.py
