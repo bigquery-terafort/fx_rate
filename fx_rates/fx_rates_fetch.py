@@ -1,12 +1,9 @@
 """
 Daily FX Rates → BigQuery Pipeline
-Fetches USD exchange rates from frankfurter.app (ECB data, free, no API key)
+Fetches USD exchange rates from TWO sources:
+  1. frankfurter.app (ECB data, 30 currencies, historical dates)
+  2. open.er-api.com (160+ currencies, latest rates, fallback)
 Loads into terafort.cross_platform.daily_fx_rates
-
-Hybrid approach:
-  - GP Earnings table: 100% accurate USD (3-4 weeks delayed)
-  - GP Sales table × daily_fx_rates: ~99.5% accurate (real-time)
-  - Staging query auto-picks the best source per date
 """
 
 import os
@@ -27,7 +24,7 @@ BQ_DATASET           = os.environ.get("BQ_DATASET", "cross_platform")
 BQ_TABLE             = os.environ.get("BQ_TABLE", "daily_fx_rates")
 LOOKBACK_DAYS        = int(os.environ.get("FX_LOOKBACK_DAYS", "7"))
 
-# All currencies seen in your GP Sales data
+# All currencies seen across GP Sales, Apple, and other platforms
 CURRENCIES = [
     "INR", "IDR", "EUR", "TRY", "MYR", "SAR", "BRL", "PHP",
     "ILS", "LKR", "PLN", "CAD", "PKR", "AED", "MXN", "NGN",
@@ -37,10 +34,15 @@ CURRENCIES = [
     "IQD", "CZK", "TZS", "BDT", "EGP", "PYG", "RSD", "HKD",
     "GEL", "DZD", "QAR", "BGN", "DKK", "MNT", "HNL", "XAF",
     "XOF", "JOD", "OMR", "BHD", "KWD", "GTQ", "BOB", "UYU",
-    "ISK", "RWF", "UGX", "GHS", "ETB", "NPR", "LBP", "MZN"
+    "ISK", "RWF", "UGX", "GHS", "ETB", "NPR", "LBP", "MZN",
+    "CNY", "RUB", "ARS", "AMD", "BAM", "BWP", "DOP", "FJD",
+    "GIP", "HTG", "JMD", "KGS", "LAK", "MDL", "MKD", "MVR",
+    "MWK", "NAD", "NIO", "PAB", "SOS", "SRD", "TTD", "UZS",
+    "XCD", "YER", "ZMW",
 ]
 
 FRANKFURTER_URL = "https://api.frankfurter.app"
+FALLBACK_URL    = "https://open.er-api.com/v6/latest/USD"
 
 # ─── SCHEMA ──────────────────────────────────────────────────────────────────
 S = bigquery.SchemaField
@@ -51,11 +53,47 @@ SCHEMA = [
     S("_ingested_at", "TIMESTAMP"),
 ]
 
+# ─── FALLBACK RATES ─────────────────────────────────────────────────────────
+_fallback_cache = None
+
+def fetch_fallback_rates():
+    """Fetch latest rates from open.er-api.com (160+ currencies, free, no key)."""
+    global _fallback_cache
+    if _fallback_cache is not None:
+        return _fallback_cache
+
+    log.info("Fetching fallback rates from open.er-api.com...")
+    try:
+        resp = requests.get(FALLBACK_URL, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            rates = {}
+            for currency, rate_per_usd in data.get("rates", {}).items():
+                if rate_per_usd and rate_per_usd > 0:
+                    # Invert: 1 foreign = X USD
+                    rates[currency] = round(1.0 / rate_per_usd, 8)
+            log.info(f"  Fallback: {len(rates)} currencies loaded")
+            _fallback_cache = rates
+            return rates
+        else:
+            log.warning(f"  Fallback API HTTP {resp.status_code}")
+    except Exception as e:
+        log.warning(f"  Fallback API error: {e}")
+
+    _fallback_cache = {}
+    return {}
+
+
 # ─── FX FETCH ────────────────────────────────────────────────────────────────
-def fetch_rates_for_date(rate_date):
-    """Fetch 1 USD = X foreign currency rates, then invert to get 1 FOREIGN = X USD."""
+def fetch_rates_for_date(rate_date, fallback_rates):
+    """
+    Fetch rates for a single date:
+    1. Try frankfurter.app (ECB, ~30 currencies)
+    2. Fill missing currencies from fallback (open.er-api.com latest rates)
+    """
     date_str = rate_date.strftime("%Y-%m-%d")
     rows = []
+    fetched_currencies = set()
 
     # Always add USD = 1.0
     rows.append({
@@ -64,16 +102,15 @@ def fetch_rates_for_date(rate_date):
         "usd_rate": 1.0,
         "_ingested_at": datetime.utcnow().isoformat(),
     })
+    fetched_currencies.add("USD")
 
-    # Frankfurter supports max ~40 currencies per call
-    # Split into batches
+    # ── SOURCE 1: Frankfurter (ECB, 30 currencies, historical) ──
     batch_size = 30
     for i in range(0, len(CURRENCIES), batch_size):
         batch = CURRENCIES[i:i + batch_size]
         symbols = ",".join(batch)
 
         try:
-            # Get: 1 USD = X foreign currency
             resp = requests.get(
                 f"{FRANKFURTER_URL}/{date_str}",
                 params={"from": "USD", "to": symbols},
@@ -86,7 +123,6 @@ def fetch_rates_for_date(rate_date):
 
                 for currency, rate_per_usd in rates.items():
                     if rate_per_usd and rate_per_usd > 0:
-                        # Invert: 1 foreign = X USD
                         usd_rate = round(1.0 / rate_per_usd, 8)
                         rows.append({
                             "rate_date": date_str,
@@ -94,14 +130,31 @@ def fetch_rates_for_date(rate_date):
                             "usd_rate": usd_rate,
                             "_ingested_at": datetime.utcnow().isoformat(),
                         })
+                        fetched_currencies.add(currency)
             elif resp.status_code == 404:
-                # Weekend or holiday — no rates available
-                log.info(f"  {date_str}: No rates (weekend/holiday)")
+                pass  # Weekend/holiday
             else:
                 log.warning(f"  {date_str}: HTTP {resp.status_code}")
 
         except Exception as e:
             log.warning(f"  {date_str} batch error: {e}")
+
+    # ── SOURCE 2: Fill missing from fallback ──
+    missing = [c for c in CURRENCIES if c not in fetched_currencies]
+    if missing and fallback_rates:
+        filled = 0
+        for currency in missing:
+            if currency in fallback_rates:
+                rows.append({
+                    "rate_date": date_str,
+                    "currency_code": currency,
+                    "usd_rate": fallback_rates[currency],
+                    "_ingested_at": datetime.utcnow().isoformat(),
+                })
+                fetched_currencies.add(currency)
+                filled += 1
+        if filled:
+            log.debug(f"  {date_str}: {filled} currencies filled from fallback")
 
     return rows
 
@@ -109,6 +162,10 @@ def fetch_rates_for_date(rate_date):
 def fetch_all_rates():
     """Fetch rates for lookback period, forward-filling weekends."""
     log.info(f"Fetching FX rates for last {LOOKBACK_DAYS} days...")
+
+    # Pre-fetch fallback rates (called once, cached)
+    fallback_rates = fetch_fallback_rates()
+
     all_rows = []
     last_known_rates = {}
 
@@ -117,7 +174,7 @@ def fetch_all_rates():
     current = start_date
 
     while current <= end_date:
-        day_rows = fetch_rates_for_date(current)
+        day_rows = fetch_rates_for_date(current, fallback_rates)
 
         if len(day_rows) > 1:  # More than just USD
             # Update last known rates
@@ -197,9 +254,11 @@ def load_to_bq(bq, rows):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
-    log.info("💱 FX Rates → BigQuery Pipeline")
+    log.info("FX Rates BigQuery Pipeline (Dual Source)")
     log.info(f"   Dataset: {BQ_DATASET}.{BQ_TABLE}")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days")
+    log.info(f"   Primary: frankfurter.app (ECB, 30 currencies)")
+    log.info(f"   Fallback: open.er-api.com (160+ currencies)")
 
     bq = get_bq()
     ensure_table(bq)
@@ -207,7 +266,7 @@ def main():
     rows = fetch_all_rates()
     load_to_bq(bq, rows)
 
-    log.info("✅ FX rates sync complete!")
+    log.info("FX rates sync complete!")
 
 
 if __name__ == "__main__":
